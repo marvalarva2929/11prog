@@ -1,0 +1,76 @@
+Name: Josh Vigel
+EID: jv27382
+
+==== How to Compile and Run ====
+
+  bash build.sh
+  ./build/hw11
+
+The build script runs CMake + make. The executable runs unit tests followed
+by the LRU vs Random policy comparison.
+
+==== Implementation Notes ====
+
+Cache geometry:
+  L1 Instruction: 512 sets, 1-way (direct-mapped), 64-byte lines
+  L1 Data:        256 sets, 2-way set-associative, 64-byte lines
+  L2:            8192 sets, 4-way set-associative, 64-byte lines
+
+Address layout (MSB→LSB): tag | index | offset (6 offset bits).
+
+Policy: write-back, write-allocate. L2 is inclusive of L1: on any L2
+eviction the corresponding L1i and L1d lines are invalidated. If an L1
+line is dirty at invalidation time it is written directly to memory (since
+the L2 line is being discarded). Dirty L1 evictions to L2 count as L2
+accesses in the stats.
+
+L1 cache coherency: before any L1i read or write, any dirty L1d copy of
+the same line is flushed to L2 (and vice-versa), so the other L1 always
+reads the latest data from L2.
+
+==== Testing Methodology: LRU vs Random Replacement ====
+
+Four access patterns were used to compare the two policies:
+
+1. Sequential Scan (1 MB)
+   Reads 1 MB of memory linearly. Every cache line is accessed exactly
+   once so no reuse is possible. Both policies produce identical miss
+   counts (16,384 L1d misses, 16,384 L2 misses) because the replacement
+   decision never matters when there is no temporal locality.
+
+2. Strided Access (4 KB stride, 10,000 accesses)
+   Accesses memory with a 4 KB stride, cycling through the 16 MB address
+   space. Each access maps to a different L1d set, so nearly every access
+   is an L1d miss regardless of policy. Both policies again perform
+   similarly (~10,000 L1d misses each) since the working set never
+   re-enters the cache.
+
+3. Working-Set Loop (128 KB working set, 8 passes)
+   Repeatedly scans a 128 KB region (4× the 32 KB L1d capacity) in
+   cache-line-sized steps for 8 passes. The first pass cold-misses all
+   2,048 L2 lines. On subsequent passes, LRU evicts lines in strict FIFO
+   order causing every access after pass 1 to miss in L1d (16,384 total
+   misses). Random eviction occasionally keeps a useful line alive,
+   producing slightly fewer L1d misses (~16,269) while L2 miss counts
+   remain equal at 2,048 — the working set fits in L2 regardless.
+
+4. L1d Thrash (5-way conflict into a 2-way cache, 2,000 rounds)
+   Repeatedly accesses 5 addresses that all map to the same L1d set,
+   which can only hold 2 lines. LRU deterministically evicts the line
+   that will be needed next, producing a miss on every single access after
+   the first two cold loads (10,000 misses for 2,000 × 5 accesses).
+   Random policy sometimes keeps the right line, lowering misses to ~9,342.
+   This is the pattern where Random outperforms LRU most clearly.
+
+Summary of Results:
+  - Sequential / strided workloads: LRU ≈ Random (no reuse to exploit).
+  - Working-set loop: Random marginally better in L1d.
+  - Conflict thrash: Random noticeably better (~6% fewer L1d misses)
+    because LRU degenerates into a worst-case cyclic eviction pattern
+    while Random escapes it probabilistically.
+
+In general, LRU is optimal for workloads with strong temporal locality
+(recently-used lines are likely to be reused). Random performs comparably
+or slightly better on adversarial conflict patterns where LRU's determinism
+becomes a liability, and it has the advantage of constant-time selection
+with no per-way metadata overhead.
