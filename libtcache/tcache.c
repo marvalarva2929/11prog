@@ -63,7 +63,7 @@ static int pick_victim(cache_set_t *s, int ways) {
     return rand() % ways;
 }
 
-/* ── L2 lookup (no stats) ── */
+/* ── L2 lookup (no stats, no LRU update) ── */
 static int l2_find_way(uint64_t a) {
     uint64_t si = l2_idx(a), t = l2_tag(a);
     for (int i = 0; i < L2_WAYS; i++)
@@ -71,28 +71,63 @@ static int l2_find_way(uint64_t a) {
     return -1;
 }
 
-/* ── Invalidate L1i line on L2 eviction (writes dirty data to memory) ── */
-static void inval_l1i(uint64_t ba) {
+/* ── Write dirty L1i line back to L2. Counts as L2 access, updates L2 LRU. ── */
+static void wb_l1i_to_l2(uint64_t ba, uint8_t *data) {
+    st_l2.accesses++;
+    int w = l2_find_way(ba);
+    if (w >= 0) {
+        uint64_t si = l2_idx(ba);
+        memcpy(l2[si].lines[w].data, data, LINE_SIZE);
+        l2[si].lines[w].modified = 1;
+        l2[si].lru[w]            = g_tick++;  /* retouch: now MRU */
+    } else {
+        /* inclusive invariant broken; fall back to memory */
+        for (int b = 0; b < LINE_SIZE; b++) write_memory(ba + b, data[b]);
+    }
+}
+
+/* ── Write dirty L1d line back to L2. Counts as L2 access, updates L2 LRU. ── */
+static void wb_l1d_to_l2(uint64_t ba, uint8_t *data) {
+    st_l2.accesses++;
+    int w = l2_find_way(ba);
+    if (w >= 0) {
+        uint64_t si = l2_idx(ba);
+        memcpy(l2[si].lines[w].data, data, LINE_SIZE);
+        l2[si].lines[w].modified = 1;
+        l2[si].lru[w]            = g_tick++;  /* retouch: now MRU */
+    } else {
+        for (int b = 0; b < LINE_SIZE; b++) write_memory(ba + b, data[b]);
+    }
+}
+
+/* ── During L2 eviction of the line at base `ba`:
+      Write dirty L1i data into the soon-to-be-evicted L2 line (L2 access),
+      then invalidate the L1i line. Non-dirty L1i lines are just invalidated. ── */
+static void l2_evict_handle_l1i(uint64_t ba, cache_line_t *l2_line) {
     uint64_t si = l1i_idx(ba), t = l1i_tag(ba);
     for (int i = 0; i < L1_INSTR_WAYS; i++) {
         if (l1i[si].lines[i].valid && l1i[si].lines[i].tag == t) {
-            if (l1i[si].lines[i].modified)
-                for (int b = 0; b < LINE_SIZE; b++)
-                    write_memory(ba + b, l1i[si].lines[i].data[b]);
+            if (l1i[si].lines[i].modified) {
+                st_l2.accesses++;
+                memcpy(l2_line->data, l1i[si].lines[i].data, LINE_SIZE);
+                l2_line->modified = 1;
+            }
             l1i[si].lines[i].valid    = 0;
             l1i[si].lines[i].modified = 0;
         }
     }
 }
 
-/* ── Invalidate L1d line on L2 eviction ── */
-static void inval_l1d(uint64_t ba) {
+/* ── Same for L1d during L2 eviction. ── */
+static void l2_evict_handle_l1d(uint64_t ba, cache_line_t *l2_line) {
     uint64_t si = l1d_idx(ba), t = l1d_tag(ba);
     for (int i = 0; i < L1_DATA_WAYS; i++) {
         if (l1d[si].lines[i].valid && l1d[si].lines[i].tag == t) {
-            if (l1d[si].lines[i].modified)
-                for (int b = 0; b < LINE_SIZE; b++)
-                    write_memory(ba + b, l1d[si].lines[i].data[b]);
+            if (l1d[si].lines[i].modified) {
+                st_l2.accesses++;
+                memcpy(l2_line->data, l1d[si].lines[i].data, LINE_SIZE);
+                l2_line->modified = 1;
+            }
             l1d[si].lines[i].valid    = 0;
             l1d[si].lines[i].modified = 0;
         }
@@ -114,8 +149,10 @@ static int l2_ensure(uint64_t a) {
 
     if (l2[si].lines[v].valid) {
         uint64_t eb = rebuild_l2(si, l2[si].lines[v].tag);
-        inval_l1i(eb);
-        inval_l1d(eb);
+        /* Collect dirty L1 data into the L2 line (as L2 accesses) before evicting */
+        l2_evict_handle_l1i(eb, &l2[si].lines[v]);
+        l2_evict_handle_l1d(eb, &l2[si].lines[v]);
+        /* Write back dirty L2 line to memory */
         if (l2[si].lines[v].modified)
             for (int b = 0; b < LINE_SIZE; b++)
                 write_memory(eb + b, l2[si].lines[v].data[b]);
@@ -128,32 +165,6 @@ static int l2_ensure(uint64_t a) {
     l2[si].lines[v].tag      = t;
     l2[si].lru[v]            = g_tick++;
     return v;
-}
-
-/* ── Write dirty L1i line back to L2 on eviction. Counts as L2 access. ── */
-static void wb_l1i_to_l2(uint64_t ba, uint8_t *data) {
-    st_l2.accesses++;
-    int w = l2_find_way(ba);
-    if (w >= 0) {
-        uint64_t si = l2_idx(ba);
-        memcpy(l2[si].lines[w].data, data, LINE_SIZE);
-        l2[si].lines[w].modified = 1;
-    } else {
-        for (int b = 0; b < LINE_SIZE; b++) write_memory(ba + b, data[b]);
-    }
-}
-
-/* ── Write dirty L1d line back to L2 on eviction. Counts as L2 access. ── */
-static void wb_l1d_to_l2(uint64_t ba, uint8_t *data) {
-    st_l2.accesses++;
-    int w = l2_find_way(ba);
-    if (w >= 0) {
-        uint64_t si = l2_idx(ba);
-        memcpy(l2[si].lines[w].data, data, LINE_SIZE);
-        l2[si].lines[w].modified = 1;
-    } else {
-        for (int b = 0; b < LINE_SIZE; b++) write_memory(ba + b, data[b]);
-    }
 }
 
 /* ── Load addr into L1i from L2 (L2 must already have it). Returns way. ── */
@@ -190,7 +201,7 @@ static int l1d_load(uint64_t a) {
     return v;
 }
 
-/* ── Flush dirty L1i copy of addr to L2 (cross-cache coherency) ── */
+/* ── Flush dirty L1i to L2 without invalidating (for READ coherency). ── */
 static void coherency_flush_l1i(uint64_t a) {
     uint64_t ba = baddr(a), si = l1i_idx(ba), t = l1i_tag(ba);
     for (int i = 0; i < L1_INSTR_WAYS; i++)
@@ -200,12 +211,36 @@ static void coherency_flush_l1i(uint64_t a) {
         }
 }
 
-/* ── Flush dirty L1d copy of addr to L2 (cross-cache coherency) ── */
+/* ── Flush dirty L1d to L2 without invalidating (for READ coherency). ── */
 static void coherency_flush_l1d(uint64_t a) {
     uint64_t ba = baddr(a), si = l1d_idx(ba), t = l1d_tag(ba);
     for (int i = 0; i < L1_DATA_WAYS; i++)
         if (l1d[si].lines[i].valid && l1d[si].lines[i].tag == t && l1d[si].lines[i].modified) {
             wb_l1d_to_l2(ba, l1d[si].lines[i].data);
+            l1d[si].lines[i].modified = 0;
+        }
+}
+
+/* ── Flush dirty L1i to L2 AND INVALIDATE it (for WRITE coherency). ── */
+static void coherency_inval_l1i(uint64_t a) {
+    uint64_t ba = baddr(a), si = l1i_idx(ba), t = l1i_tag(ba);
+    for (int i = 0; i < L1_INSTR_WAYS; i++)
+        if (l1i[si].lines[i].valid && l1i[si].lines[i].tag == t) {
+            if (l1i[si].lines[i].modified)
+                wb_l1i_to_l2(ba, l1i[si].lines[i].data);
+            l1i[si].lines[i].valid    = 0;
+            l1i[si].lines[i].modified = 0;
+        }
+}
+
+/* ── Flush dirty L1d to L2 AND INVALIDATE it (for WRITE coherency). ── */
+static void coherency_inval_l1d(uint64_t a) {
+    uint64_t ba = baddr(a), si = l1d_idx(ba), t = l1d_tag(ba);
+    for (int i = 0; i < L1_DATA_WAYS; i++)
+        if (l1d[si].lines[i].valid && l1d[si].lines[i].tag == t) {
+            if (l1d[si].lines[i].modified)
+                wb_l1d_to_l2(ba, l1d[si].lines[i].data);
+            l1d[si].lines[i].valid    = 0;
             l1d[si].lines[i].modified = 0;
         }
 }
@@ -225,6 +260,7 @@ void init_cache(replacement_policy_e policy) {
 
 uint8_t read_cache(uint64_t mem_addr, mem_type_t type) {
     if (type == INSTR) {
+        /* Flush dirty L1d copy to L2 so L1i reads the latest value from L2 */
         coherency_flush_l1d(mem_addr);
 
         st_l1i.accesses++;
@@ -241,6 +277,7 @@ uint8_t read_cache(uint64_t mem_addr, mem_type_t type) {
         int w = l1i_load(mem_addr);
         return l1i[si].lines[w].data[off(mem_addr)];
     } else {
+        /* Flush dirty L1i copy to L2 so L1d reads the latest value from L2 */
         coherency_flush_l1i(mem_addr);
 
         st_l1d.accesses++;
@@ -261,7 +298,8 @@ uint8_t read_cache(uint64_t mem_addr, mem_type_t type) {
 
 void write_cache(uint64_t mem_addr, uint8_t value, mem_type_t type) {
     if (type == INSTR) {
-        coherency_flush_l1d(mem_addr);
+        /* Write invalidate: flush dirty L1d copy to L2 then invalidate L1d line */
+        coherency_inval_l1d(mem_addr);
 
         st_l1i.accesses++;
         uint64_t si = l1i_idx(mem_addr), t = l1i_tag(mem_addr);
@@ -280,7 +318,8 @@ void write_cache(uint64_t mem_addr, uint8_t value, mem_type_t type) {
         l1i[si].lines[w].data[off(mem_addr)] = value;
         l1i[si].lines[w].modified             = 1;
     } else {
-        coherency_flush_l1i(mem_addr);
+        /* Write invalidate: flush dirty L1i copy to L2 then invalidate L1i line */
+        coherency_inval_l1i(mem_addr);
 
         st_l1d.accesses++;
         uint64_t si = l1d_idx(mem_addr), t = l1d_tag(mem_addr);

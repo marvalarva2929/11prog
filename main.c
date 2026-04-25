@@ -138,6 +138,18 @@ static void test_coherency(void) {
     write_cache(0x7000, 0x99, DATA);
     v = read_cache(0x7000, INSTR);
     CHECK(v == 0x99, "INSTR read sees DATA write (coherency)");
+
+    /* Write to DATA invalidates L1i (write-invalidate protocol) */
+    read_cache(0xA000, INSTR);  /* load into L1i */
+    CHECK(get_l1_instr_cache_line(0xA000) != NULL, "L1i has line before DATA write");
+    write_cache(0xA000, 0x11, DATA);
+    CHECK(get_l1_instr_cache_line(0xA000) == NULL, "L1i invalidated after DATA write");
+
+    /* Write to INSTR invalidates L1d (write-invalidate protocol) */
+    read_cache(0xB000, DATA);   /* load into L1d */
+    CHECK(get_l1_data_cache_line(0xB000) != NULL, "L1d has line before INSTR write");
+    write_cache(0xB000, 0x22, INSTR);
+    CHECK(get_l1_data_cache_line(0xB000) == NULL, "L1d invalidated after INSTR write");
 }
 
 static void test_get_cache_line(void) {
